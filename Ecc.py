@@ -1,87 +1,109 @@
-from tinyec import registry
-from Crypto.Cipher import AES
-import hashlib, secrets, binascii
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+import os
+import base64
 
-# Hàm mã hóa tin nhắn bằng AES-GCM
-def encrypt_AES_GCM(msg, secretKey):
-    # Tạo đối tượng AES mới với chế độ GCM
-    aesCipher = AES.new(secretKey, AES.MODE_GCM)
-    # Mã hóa tin nhắn và tạo tag xác thực
-    ciphertext, authTag = aesCipher.encrypt_and_digest(msg)
-    # Trả về dữ liệu mã hóa, nonce, và tag xác thực
-    return (ciphertext, aesCipher.nonce, authTag)
+# Generate and save ECC private and public keys
+def generate_and_save_keys():
+    private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+    public_key = private_key.public_key()
 
-# Hàm giải mã tin nhắn bằng AES-GCM
-def decrypt_AES_GCM(ciphertext, nonce, authTag, secretKey):
-    # Tạo đối tượng AES mới với chế độ GCM và nonce
-    aesCipher = AES.new(secretKey, AES.MODE_GCM, nonce=nonce)
-    # Giải mã dữ liệu và xác thực tag
-    plaintext = aesCipher.decrypt_and_verify(ciphertext, authTag)
-    # Trả về tin nhắn gốc
-    return plaintext
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
 
-# Chuyển đổi điểm ECC thành khóa 256-bit
-def ecc_point_to_256_bit_key(point):
-    # Băm (hash) tọa độ x của điểm ECC
-    sha = hashlib.sha256(int.to_bytes(point.x, 32, 'big'))
-    # Băm (hash) tọa độ y của điểm ECC
-    sha.update(int.to_bytes(point.y, 32, 'big'))
-    # Trả về khóa bí mật 256-bit
-    return sha.digest()
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
 
-# Lấy đường cong ECC từ thư viện
-curve = registry.get_curve('brainpoolP256r1')
+    with open('private_key.pem', 'wb') as f:
+        f.write(private_pem)
+    with open('public_key.pem', 'wb') as f:
+        f.write(public_pem)
 
-# Mã hóa tin nhắn bằng ECC và AES-GCM
-def encrypt_ECC(msg, pubKey):
-    # Tạo khóa riêng ngẫu nhiên
-    ciphertextPrivKey = secrets.randbelow(curve.field.n)
-    # Tính toán khóa chia sẻ từ khóa riêng và khóa công cộng
-    sharedECCKey = ciphertextPrivKey * pubKey
-    # Chuyển đổi điểm ECC thành khóa bí mật
-    secretKey = ecc_point_to_256_bit_key(sharedECCKey)
-    # Mã hóa tin nhắn với khóa bí mật
-    ciphertext, nonce, authTag = encrypt_AES_GCM(msg, secretKey)
-    # Tính toán khóa công cộng của dữ liệu mã hóa
-    ciphertextPubKey = ciphertextPrivKey * curve.g
-    # Trả về dữ liệu mã hóa, nonce, tag xác thực và khóa công cộng của dữ liệu mã hóa
-    return (ciphertext, nonce, authTag, ciphertextPubKey)
+# Load ECC private and public keys
+def load_keys():
+    with open('private_key.pem', 'rb') as f:
+        private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
+    with open('public_key.pem', 'rb') as f:
+        public_key = serialization.load_pem_public_key(f.read(), backend=default_backend())
+    return private_key, public_key
 
-# Giải mã tin nhắn mã hóa bằng ECC và AES-GCM
-def decrypt_ECC(encryptedMsg, privKey):
-    # Tách các thành phần của dữ liệu mã hóa
-    (ciphertext, nonce, authTag, ciphertextPubKey) = encryptedMsg
-    # Tính toán khóa chia sẻ từ khóa riêng và khóa công cộng của dữ liệu mã hóa
-    sharedECCKey = privKey * ciphertextPubKey
-    # Chuyển đổi điểm ECC thành khóa bí mật
-    secretKey = ecc_point_to_256_bit_key(sharedECCKey)
-    # Giải mã tin nhắn với khóa bí mật
-    plaintext = decrypt_AES_GCM(ciphertext, nonce, authTag, secretKey)
-    # Trả về tin nhắn gốc
-    return plaintext
+# Generate a shared key from the private and public keys
+def generate_shared_key(private_key, public_key):
+    shared_key = private_key.exchange(ec.ECDH(), public_key)
+    salt = os.urandom(16)
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100000,
+        backend=default_backend()
+    )
+    key = kdf.derive(shared_key)
+    return key, salt
 
-# Nhận dữ liệu đầu vào từ người dùng
-msg = input("Enter the message to be encrypted: ").encode('utf-8')
-print("Original message:", msg)
+# Encryption function
+def encrypt_data(data, private_key, public_key):
+    key, salt = generate_shared_key(private_key, public_key)
+    nonce = os.urandom(16)
+    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce), backend=default_backend())
+    encryptor = cipher.encryptor()
+    encrypted = encryptor.update(data) + encryptor.finalize()
+    tag = encryptor.tag
+    return base64.b64encode(salt + nonce + tag + encrypted).decode(), base64.b64encode(key).decode()
 
-# Tạo cặp khóa ECC
-privKey = secrets.randbelow(curve.field.n)  # Khóa riêng
-pubKey = privKey * curve.g  # Khóa công cộng
+# Decryption function
+def decrypt_data(encrypted_data, key):
+    encrypted_data = base64.b64decode(encrypted_data)
+    salt, nonce, tag, encrypted = encrypted_data[:16], encrypted_data[16:32], encrypted_data[32:48], encrypted_data[48:]
+    key = base64.b64decode(key)
+    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag), backend=default_backend())
+    decryptor = cipher.decryptor()
+    return decryptor.update(encrypted) + decryptor.finalize()
 
-# Mã hóa tin nhắn
-encryptedMsg = encrypt_ECC(msg, pubKey)
-encryptedMsgObj = {
-    'ciphertext': binascii.hexlify(encryptedMsg[0]).decode('utf-8'),  # Dữ liệu mã hóa
-    'nonce': binascii.hexlify(encryptedMsg[1]).decode('utf-8'),  # Nonce của AES-GCM
-    'authTag': binascii.hexlify(encryptedMsg[2]).decode('utf-8'),  # Tag xác thực của AES-GCM
-    'ciphertextPubKey': hex(encryptedMsg[3].x) + hex(encryptedMsg[3].y % 2)[2:]  # Khóa công cộng của dữ liệu mã hóa
-}
-print("Encrypted message:", encryptedMsgObj)
+# Generate keys if not exist
+if not os.path.exists('private_key.pem') or not os.path.exists('public_key.pem'):
+    generate_and_save_keys()
 
-# Giải mã tin nhắn
-decryptedMsg = decrypt_ECC(encryptedMsg, privKey)
-print("Decrypted message:", decryptedMsg.decode('utf-8'))
-#ciphertext là dữ liệu đã mã hóa.
-#nonce là giá trị độc nhất để đảm bảo mã hóa không bị lặp lại
-#authTag là tag chứng thực để kiểm tra tính toàn vẹn của dữ liệu.
-#ciphertextPubKey là khóa công cộng được sử dụng để tính toán khóa chia sẻ trong quá trình giải mã.
+# Load keys
+private_key, public_key = load_keys()
+
+def main_menu():
+    while True:
+        print("\nMã hoá văn bản bằng thuật toán ECC")
+        print("1. Encrypt")
+        print("2. Decrypt")
+        print("3. Thoát chương trình")
+        choice = input("Lựa chọn của bạn: ").strip()
+
+        if choice == '1':
+            data = input("Nhập dòng chữ muốn mã hoá: ").encode()
+            encrypted_data, key = encrypt_data(data, private_key, public_key)
+            print("Đoạn chữ được mã hoá thành:", encrypted_data)
+            print("Key:", key)
+
+        elif choice == '2':
+            encrypted_data = input("Nhập dòng chữ được mã khoá: ")
+            key = input("Nhập key: ")
+            try:
+                decrypted_data = decrypt_data(encrypted_data, key)
+                print("Đoạn mã ban đầu:", decrypted_data.decode())
+            except Exception as e:
+                print("Giải mã bị lỗi rồi bạn ơi, vui lòng nhập lại. Lỗi tên là: ", str(e))
+
+        elif choice == '3':
+            print("Cảm ơn đã sử dụng chương trình.")
+            break
+
+        else:
+            print("Chọn sai rồi. Vui lòng chọn lại nha ^^.")
+
+if __name__ == "__main__":
+    main_menu()
